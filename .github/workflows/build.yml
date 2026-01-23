@@ -73,7 +73,9 @@ jobs:
         run: |
           cd workdir/void-packages
           export PATH="$(realpath ../xbps-static/usr/bin):$PATH"
-          XBPS_ALLOW_CHROOT_BREAKOUT=1 ./xbps-src binary-bootstrap
+          echo "XBPS_CHROOT_CMD=ethereal" >> etc/conf
+          echo "XBPS_ALLOW_RESTRICTED=yes" >> etc/conf
+          ./xbps-src binary-bootstrap
 
       - name: Build packages
         run: |
@@ -81,7 +83,7 @@ jobs:
           export PATH="$(realpath ../xbps-static/usr/bin):$PATH"
           for pkg in pipa-metapkg pipa-bt-quirk pipa-sensors qbootctl; do
             echo "Building $pkg..."
-            XBPS_ALLOW_CHROOT_BREAKOUT=1 ./xbps-src -a aarch64 pkg $pkg || true
+            ./xbps-src -a aarch64 pkg $pkg || true
           done
 
       - name: Collect built packages
