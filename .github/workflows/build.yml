@@ -1,0 +1,374 @@
+name: Build Void Linux for Xiaomi Pad 6
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+  workflow_dispatch:
+    inputs:
+      target:
+        description: 'Build target'
+        required: true
+        default: 'gnome'
+        type: choice
+        options:
+          - base
+          - kde
+          - gnome
+          - all
+
+jobs:
+  build-packages:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /usr/local/lib/android
+          sudo rm -rf /opt/ghc
+          sudo rm -rf /opt/hostedtoolcache/CodeQL
+          sudo docker image prune --all --force
+          df -h
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            wget curl git tar xz-utils \
+            qemu-user-static binfmt-support
+
+      - name: Setup QEMU for aarch64
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm64
+
+      - name: Download xbps-static
+        run: |
+          mkdir -p workdir
+          cd workdir
+          wget https://repo-fi.voidlinux.org/static/xbps-static-latest.x86_64-musl.tar.xz -O xbps-static.tar.xz
+          mkdir xbps-static
+          tar xf xbps-static.tar.xz -C xbps-static
+
+      - name: Clone void-packages
+        run: |
+          cd workdir
+          git clone https://github.com/void-linux/void-packages --depth=1
+
+      - name: Clone custom_repo
+        run: |
+          cd workdir
+          git clone https://github.com/userg0d/custom_repo --depth=1
+
+      - name: Copy package templates
+        run: |
+          cp -r packages/* workdir/void-packages/srcpkgs/
+          cp -r workdir/custom_repo/srcpkgs/* workdir/void-packages/srcpkgs/
+
+      - name: Bootstrap void-packages
+        run: |
+          cd workdir/void-packages
+          export PATH="$(realpath ../xbps-static/usr/bin):$PATH"
+          XBPS_ALLOW_CHROOT_BREAKOUT=1 ./xbps-src binary-bootstrap
+
+      - name: Build packages
+        run: |
+          cd workdir/void-packages
+          export PATH="$(realpath ../xbps-static/usr/bin):$PATH"
+          for pkg in pipa-metapkg pipa-bt-quirk pipa-sensors qbootctl; do
+            echo "Building $pkg..."
+            XBPS_ALLOW_CHROOT_BREAKOUT=1 ./xbps-src -a aarch64 pkg $pkg || true
+          done
+
+      - name: Collect built packages
+        run: |
+          mkdir -p workdir/repo
+          cp -rv workdir/void-packages/hostdir/binpkgs/* workdir/repo/ || true
+          ls -la workdir/repo/
+
+      - name: Upload packages artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: void-pipa-packages
+          path: workdir/repo/
+          retention-days: 7
+
+  build-rootfs:
+    needs: build-packages
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        target: ${{ github.event_name == 'workflow_dispatch' && fromJSON(format('["{0}"]', inputs.target)) || fromJSON('["gnome"]') }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /usr/local/lib/android
+          sudo rm -rf /opt/ghc
+          sudo rm -rf /opt/hostedtoolcache/CodeQL
+          sudo docker image prune --all --force
+          df -h
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            wget curl git tar xz-utils \
+            e2fsprogs android-sdk-libsparse-utils \
+            qemu-user-static binfmt-support \
+            util-linux kmod coreutils
+
+      - name: Setup QEMU for aarch64
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm64
+
+      - name: Download packages artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: void-pipa-packages
+          path: workdir/repo/
+
+      - name: Download Void Linux rootfs
+        run: |
+          mkdir -p workdir
+          cd workdir
+          wget https://repo-fi.voidlinux.org/live/current/void-aarch64-ROOTFS-20250202.tar.xz -O rootfs.tar.xz
+
+      - name: Download qemu-aarch64-static
+        run: |
+          cd workdir
+          wget https://github.com/multiarch/qemu-user-static/releases/download/v7.2.0-1/qemu-aarch64-static
+          chmod +x qemu-aarch64-static
+
+      - name: Create base rootfs image
+        run: |
+          cd workdir
+          
+          # Create ext4 image
+          truncate -s 4G linux.img
+          mkfs.ext4 linux.img
+          
+          # Mount and extract
+          sudo mkdir -p rootfs_mountpoint
+          sudo mount linux.img rootfs_mountpoint
+          sudo tar xf rootfs.tar.xz -C rootfs_mountpoint
+          
+          # Install qemu-aarch64-static
+          sudo install -m755 qemu-aarch64-static rootfs_mountpoint/usr/bin/
+          
+          # Bind mounts
+          sudo mount --bind /dev rootfs_mountpoint/dev
+          sudo mount --bind /dev/pts rootfs_mountpoint/dev/pts
+          sudo mount --bind /proc rootfs_mountpoint/proc
+          sudo mount --bind /sys rootfs_mountpoint/sys
+          
+          # Configure system
+          echo "pad" | sudo tee rootfs_mountpoint/etc/hostname
+          uuid=$(sudo blkid -o value -s UUID linux.img)
+          echo "UUID=$uuid / ext4 defaults 0 0" | sudo tee -a rootfs_mountpoint/etc/fstab
+          echo "nameserver 1.1.1.1" | sudo tee rootfs_mountpoint/etc/resolv.conf
+          echo "root=UUID=$uuid noquiet loglevel=2 console=tty0 earlycon=tty0 keep_bootcon fbcon=rotate:1 fbcon=font:VGA8x16 rw" | sudo tee rootfs_mountpoint/etc/cmdline
+          
+          # Create user
+          sudo chroot rootfs_mountpoint useradd -m -g users -G wheel User || true
+          
+          # Set passwords
+          echo 'root:pipa' | sudo chroot rootfs_mountpoint chpasswd
+          echo 'User:123' | sudo chroot rootfs_mountpoint chpasswd
+          
+          # Sudoers
+          echo "%wheel ALL=(ALL:ALL) ALL" | sudo tee rootfs_mountpoint/etc/sudoers.d/wheel
+          
+          # Update system
+          sudo chroot rootfs_mountpoint xbps-install -Syu xbps
+          sudo chroot rootfs_mountpoint xbps-install -Syuv
+          sudo chroot rootfs_mountpoint xbps-install -Sy NetworkManager chrony fake-hwclock nano
+          
+          # Install zzz CPU control hook
+          sudo mkdir -p rootfs_mountpoint/etc/zzz.d
+          sudo install -m755 ../config/zzz/99-cpu-control.sh rootfs_mountpoint/etc/zzz.d/
+          
+          # Enable services
+          sudo chroot rootfs_mountpoint ln -sf /etc/sv/dbus /etc/runit/runsvdir/default/
+          sudo chroot rootfs_mountpoint ln -sf /etc/sv/NetworkManager /etc/runit/runsvdir/default/
+          sudo chroot rootfs_mountpoint ln -sf /etc/sv/chronyd /etc/runit/runsvdir/default/
+          
+          # Install custom packages
+          sudo mkdir -p rootfs_mountpoint/repo
+          sudo mount --bind repo rootfs_mountpoint/repo
+          sudo chroot rootfs_mountpoint xbps-install -y --repository /repo pipa-metapkg pipa-bt-quirk qbootctl || true
+          sudo umount rootfs_mountpoint/repo
+          sudo rm -rf rootfs_mountpoint/repo
+          
+          # Cleanup
+          sudo rm -f rootfs_mountpoint/usr/bin/qemu-aarch64-static
+          sudo umount -R rootfs_mountpoint
+
+      - name: Build GNOME image
+        if: matrix.target == 'gnome' || matrix.target == 'all'
+        run: |
+          cd workdir
+          
+          cp linux.img linux_gnome.img
+          e2fsck -fy linux_gnome.img || true
+          resize2fs linux_gnome.img 12G
+          
+          sudo mount linux_gnome.img rootfs_mountpoint
+          sudo mount --bind /dev rootfs_mountpoint/dev
+          sudo mount --bind /dev/pts rootfs_mountpoint/dev/pts
+          sudo mount --bind /proc rootfs_mountpoint/proc
+          sudo mount --bind /sys rootfs_mountpoint/sys
+          
+          sudo install -m755 qemu-aarch64-static rootfs_mountpoint/usr/bin/
+          
+          # Install full GNOME desktop environment
+          sudo chroot rootfs_mountpoint xbps-install -Suy \
+            gnome \
+            gnome-console \
+            gnome-tweaks \
+            gnome-browser-connector \
+            firefox \
+            gdm \
+            mesa-freedreno-dri \
+            pipewire \
+            wireplumber \
+            bluez \
+            libspa-bluetooth \
+            xdg-desktop-portal-gtk \
+            xdg-desktop-portal-gnome \
+            pulseaudio \
+            linux-firmware \
+            linux-firmware-qualcomm \
+            light \
+            gst-plugins-good1 \
+            gst-plugins-bad1 \
+            gst-plugins-ugly1 \
+            gstreamer1 \
+            gstreamer-vaapi \
+            NetworkManager-openvpn \
+            gnome-keyring
+          
+          # Install custom packages
+          sudo mkdir -p rootfs_mountpoint/repo
+          sudo mount --bind repo rootfs_mountpoint/repo
+          sudo chroot rootfs_mountpoint xbps-install -y --repository /repo pipa-metapkg pipa-bt-quirk pipa-sensors qbootctl || true
+          sudo umount rootfs_mountpoint/repo
+          sudo rm -rf rootfs_mountpoint/repo
+          
+          # Enable services
+          sudo chroot rootfs_mountpoint ln -sf /etc/sv/gdm /etc/runit/runsvdir/default/
+          sudo chroot rootfs_mountpoint ln -sf /etc/sv/bluetoothd /etc/runit/runsvdir/default/
+          sudo chroot rootfs_mountpoint ln -sf /etc/sv/pipa-bt-quirk /etc/runit/runsvdir/default/ || true
+          
+          # Add user to groups
+          sudo chroot rootfs_mountpoint usermod -aG audio,video,bluetooth User
+          
+          # Cleanup
+          sudo rm -f rootfs_mountpoint/usr/bin/qemu-aarch64-static
+          sudo umount -R rootfs_mountpoint
+          
+          # Convert to sparse
+          img2simg linux_gnome.img void_gnome.img
+
+      - name: Build KDE image
+        if: matrix.target == 'kde' || matrix.target == 'all'
+        run: |
+          cd workdir
+          
+          cp linux.img linux_kde.img
+          e2fsck -fy linux_kde.img || true
+          resize2fs linux_kde.img 8G
+          
+          sudo mount linux_kde.img rootfs_mountpoint
+          sudo mount --bind /dev rootfs_mountpoint/dev
+          sudo mount --bind /dev/pts rootfs_mountpoint/dev/pts
+          sudo mount --bind /proc rootfs_mountpoint/proc
+          sudo mount --bind /sys rootfs_mountpoint/sys
+          
+          sudo install -m755 qemu-aarch64-static rootfs_mountpoint/usr/bin/
+          
+          # Install KDE
+          sudo chroot rootfs_mountpoint xbps-install -Suy kde-plasma konsole sddm mesa-freedreno-dri maliit-keyboard pipewire bluez libspa-bluetooth xdg-desktop-portal-kde pulseaudio
+          
+          # Install custom packages
+          sudo mkdir -p rootfs_mountpoint/repo
+          sudo mount --bind repo rootfs_mountpoint/repo
+          sudo chroot rootfs_mountpoint xbps-install -y --repository /repo pipa-metapkg pipa-bt-quirk qbootctl || true
+          sudo umount rootfs_mountpoint/repo
+          sudo rm -rf rootfs_mountpoint/repo
+          
+          # SDDM config
+          sudo mkdir -p rootfs_mountpoint/etc/sddm.conf.d/
+          sudo cp ../config/kde/sddm/10-wayland.conf rootfs_mountpoint/etc/sddm.conf.d/
+          sudo cp ../config/kde/sddm/50-theme.conf rootfs_mountpoint/etc/sddm.conf.d/
+          
+          # Enable services
+          sudo chroot rootfs_mountpoint ln -sf /etc/sv/sddm /etc/runit/runsvdir/default/
+          sudo chroot rootfs_mountpoint ln -sf /etc/sv/bluetoothd /etc/runit/runsvdir/default/
+          sudo chroot rootfs_mountpoint ln -sf /etc/sv/pipa-bt-quirk /etc/runit/runsvdir/default/ || true
+          
+          # Add user to groups
+          sudo chroot rootfs_mountpoint usermod -aG audio,video,bluetooth User
+          
+          # Cleanup
+          sudo rm -f rootfs_mountpoint/usr/bin/qemu-aarch64-static
+          sudo umount -R rootfs_mountpoint
+          
+          # Convert to sparse
+          img2simg linux_kde.img void_kde.img
+
+      - name: Copy boot image
+        run: |
+          mkdir -p out
+          if [ -f workdir/rootfs_mountpoint/boot/boot-*.img ]; then
+            cp workdir/rootfs_mountpoint/boot/boot-*.img out/boot.img
+          fi
+          cp workdir/void_*.img out/ 2>/dev/null || true
+          ls -la out/
+
+      - name: Upload images
+        uses: actions/upload-artifact@v4
+        with:
+          name: void-pipa-${{ matrix.target }}
+          path: out/
+          retention-days: 30
+
+  release:
+    needs: build-rootfs
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts/
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: build-${{ github.run_number }}
+          name: Build ${{ github.run_number }}
+          body: |
+            Automated build of Void Linux for Xiaomi Pad 6
+            
+            ## Images
+            - `void_gnome.img` - GNOME desktop
+            - `void_kde.img` - KDE Plasma desktop
+            - `boot.img` - Boot image
+            
+            ## Default credentials
+            - root: `pipa`
+            - User: `123`
+          files: artifacts/**/*
+          draft: false
+          prerelease: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
