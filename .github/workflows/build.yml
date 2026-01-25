@@ -205,9 +205,24 @@ jobs:
           echo "%wheel ALL=(ALL:ALL) ALL" | sudo tee rootfs_mountpoint/etc/sudoers.d/wheel > /dev/null
           
           echo "=== Updating system packages ==="
-          sudo chroot rootfs_mountpoint xbps-install -Syu xbps || echo "Failed to update xbps"
-          sudo chroot rootfs_mountpoint xbps-install -Syuv || echo "Failed to update system"
-          sudo chroot rootfs_mountpoint xbps-install -Sy NetworkManager chrony fake-hwclock nano || echo "Failed to install base packages"
+          # Retry logic for xbps-install to handle network issues
+          for i in 1 2 3; do
+            echo "Attempt $i: Updating xbps..."
+            sudo chroot rootfs_mountpoint xbps-install -Syu xbps && break
+            sleep 10
+          done || echo "Warning: Failed to update xbps after 3 attempts"
+          
+          for i in 1 2 3; do
+            echo "Attempt $i: Updating system..."
+            sudo chroot rootfs_mountpoint xbps-install -Syuv && break
+            sleep 10
+          done || echo "Warning: Failed to update system after 3 attempts"
+          
+          for i in 1 2 3; do
+            echo "Attempt $i: Installing base packages..."
+            sudo chroot rootfs_mountpoint xbps-install -Sy NetworkManager chrony fake-hwclock nano && break
+            sleep 10
+          done || echo "Warning: Failed to install base packages after 3 attempts"
           
           echo "=== Installing zzz hook ==="
           sudo mkdir -p rootfs_mountpoint/etc/zzz.d
@@ -275,24 +290,24 @@ jobs:
             gstreamer1 \
             gstreamer-vaapi \
             NetworkManager-openvpn \
-            gnome-keyring
+            gnome-keyring || (echo "Retrying GNOME install..." && sleep 30 && sudo chroot rootfs_mountpoint xbps-install -Suy gnome gnome-console gnome-tweaks gnome-browser-connector firefox gdm mesa-freedreno-dri pipewire wireplumber bluez libspa-bluetooth xdg-desktop-portal-gtk xdg-desktop-portal-gnome pulseaudio linux-firmware linux-firmware-qualcomm light gst-plugins-good1 gst-plugins-bad1 gst-plugins-ugly1 gstreamer1 gstreamer-vaapi NetworkManager-openvpn gnome-keyring) || echo "Warning: GNOME installation incomplete"
           
-          # Install custom packages
+          echo "=== Installing custom packages ==="
           sudo mkdir -p rootfs_mountpoint/repo
           sudo mount --bind repo rootfs_mountpoint/repo
-          sudo chroot rootfs_mountpoint xbps-install -y --repository /repo pipa-metapkg pipa-bt-quirk pipa-sensors qbootctl || true
-          sudo umount rootfs_mountpoint/repo
+          sudo chroot rootfs_mountpoint xbps-install -y --repository /repo pipa-metapkg pipa-bt-quirk pipa-sensors qbootctl || echo "Warning: Some custom packages failed to install"
+          sudo umount rootfs_mountpoint/repo 2>/dev/null || true
           sudo rm -rf rootfs_mountpoint/repo
           
-          # Enable services
-          sudo chroot rootfs_mountpoint ln -sf /etc/sv/gdm /etc/runit/runsvdir/default/
-          sudo chroot rootfs_mountpoint ln -sf /etc/sv/bluetoothd /etc/runit/runsvdir/default/
+          echo "=== Enabling services ==="
+          sudo chroot rootfs_mountpoint ln -sf /etc/sv/gdm /etc/runit/runsvdir/default/ || true
+          sudo chroot rootfs_mountpoint ln -sf /etc/sv/bluetoothd /etc/runit/runsvdir/default/ || true
           sudo chroot rootfs_mountpoint ln -sf /etc/sv/pipa-bt-quirk /etc/runit/runsvdir/default/ || true
           
-          # Add user to groups
-          sudo chroot rootfs_mountpoint usermod -aG audio,video,bluetooth User
+          echo "=== Adding user to groups ==="
+          sudo chroot rootfs_mountpoint usermod -aG audio,video,bluetooth User || true
           
-          # Cleanup
+          echo "=== Cleaning up ===" 
           sudo rm -f rootfs_mountpoint/usr/bin/qemu-aarch64-static
           sudo umount -R rootfs_mountpoint
           
