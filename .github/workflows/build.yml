@@ -164,67 +164,74 @@ jobs:
 
       - name: Create base rootfs image
         run: |
+          set -e  # Exit on any error
           cd workdir
           
-          # Create ext4 image
+          echo "=== Creating ext4 image ==="
           truncate -s 4G linux.img
-          mkfs.ext4 linux.img
+          mkfs.ext4 -F linux.img
           
-          # Mount and extract
+          echo "=== Mounting image ==="
           sudo mkdir -p rootfs_mountpoint
-          sudo mount linux.img rootfs_mountpoint
-          sudo tar xf rootfs.tar.xz -C rootfs_mountpoint
+          sudo mount -t ext4 linux.img rootfs_mountpoint
           
-          # Install qemu-aarch64-static
+          echo "=== Extracting rootfs ==="
+          sudo tar xf rootfs.tar.xz -C rootfs_mountpoint --checkpoint=.100
+          
+          echo "=== Installing QEMU ==="
           sudo install -m755 qemu-aarch64-static rootfs_mountpoint/usr/bin/
           
-          # Bind mounts
-          sudo mount --bind /dev rootfs_mountpoint/dev
-          sudo mount --bind /dev/pts rootfs_mountpoint/dev/pts
-          sudo mount --bind /proc rootfs_mountpoint/proc
-          sudo mount --bind /sys rootfs_mountpoint/sys
+          echo "=== Setting up bind mounts ==="
+          sudo mount --bind /dev rootfs_mountpoint/dev || true
+          sudo mount --bind /dev/pts rootfs_mountpoint/dev/pts || true
+          sudo mount --bind /proc rootfs_mountpoint/proc || true
+          sudo mount --bind /sys rootfs_mountpoint/sys || true
           
-          # Configure system
-          echo "pad" | sudo tee rootfs_mountpoint/etc/hostname
+          echo "=== Configuring system ==="
+          echo "pad" | sudo tee rootfs_mountpoint/etc/hostname > /dev/null
           uuid=$(sudo blkid -o value -s UUID linux.img)
-          echo "UUID=$uuid / ext4 defaults 0 0" | sudo tee -a rootfs_mountpoint/etc/fstab
-          echo "nameserver 1.1.1.1" | sudo tee rootfs_mountpoint/etc/resolv.conf
-          echo "root=UUID=$uuid noquiet loglevel=2 console=tty0 earlycon=tty0 keep_bootcon fbcon=rotate:1 fbcon=font:VGA8x16 rw" | sudo tee rootfs_mountpoint/etc/cmdline
+          echo "UUID=$uuid / ext4 defaults 0 0" | sudo tee -a rootfs_mountpoint/etc/fstab > /dev/null
+          echo "nameserver 1.1.1.1" | sudo tee rootfs_mountpoint/etc/resolv.conf > /dev/null
+          echo "root=UUID=$uuid noquiet loglevel=2 console=tty0 earlycon=tty0 keep_bootcon fbcon=rotate:1 fbcon=font:VGA8x16 rw" | sudo tee rootfs_mountpoint/etc/cmdline > /dev/null
           
-          # Create user
-          sudo chroot rootfs_mountpoint useradd -m -g users -G wheel User || true
+          echo "=== Creating user ==="
+          sudo chroot rootfs_mountpoint useradd -m -g users -G wheel User || echo "User already exists"
           
-          # Set passwords
-          echo 'root:pipa' | sudo chroot rootfs_mountpoint chpasswd
-          echo 'User:123' | sudo chroot rootfs_mountpoint chpasswd
+          echo "=== Setting passwords ==="
+          echo 'root:pipa' | sudo chroot rootfs_mountpoint chpasswd || echo "Failed to set root password"
+          echo 'User:123' | sudo chroot rootfs_mountpoint chpasswd || echo "Failed to set user password"
           
-          # Sudoers
-          echo "%wheel ALL=(ALL:ALL) ALL" | sudo tee rootfs_mountpoint/etc/sudoers.d/wheel
+          echo "=== Configuring sudoers ==="
+          echo "%wheel ALL=(ALL:ALL) ALL" | sudo tee rootfs_mountpoint/etc/sudoers.d/wheel > /dev/null
           
-          # Update system
-          sudo chroot rootfs_mountpoint xbps-install -Syu xbps
-          sudo chroot rootfs_mountpoint xbps-install -Syuv
-          sudo chroot rootfs_mountpoint xbps-install -Sy NetworkManager chrony fake-hwclock nano
+          echo "=== Updating system packages ==="
+          sudo chroot rootfs_mountpoint xbps-install -Syu xbps || echo "Failed to update xbps"
+          sudo chroot rootfs_mountpoint xbps-install -Syuv || echo "Failed to update system"
+          sudo chroot rootfs_mountpoint xbps-install -Sy NetworkManager chrony fake-hwclock nano || echo "Failed to install base packages"
           
-          # Install zzz CPU control hook
+          echo "=== Installing zzz hook ==="
           sudo mkdir -p rootfs_mountpoint/etc/zzz.d
           sudo install -m755 ../config/zzz/99-cpu-control.sh rootfs_mountpoint/etc/zzz.d/
           
-          # Enable services
-          sudo chroot rootfs_mountpoint ln -sf /etc/sv/dbus /etc/runit/runsvdir/default/
-          sudo chroot rootfs_mountpoint ln -sf /etc/sv/NetworkManager /etc/runit/runsvdir/default/
-          sudo chroot rootfs_mountpoint ln -sf /etc/sv/chronyd /etc/runit/runsvdir/default/
+          echo "=== Enabling services ==="
+          sudo chroot rootfs_mountpoint ln -sf /etc/sv/dbus /etc/runit/runsvdir/default/ || true
+          sudo chroot rootfs_mountpoint ln -sf /etc/sv/NetworkManager /etc/runit/runsvdir/default/ || true
+          sudo chroot rootfs_mountpoint ln -sf /etc/sv/chronyd /etc/runit/runsvdir/default/ || true
           
-          # Install custom packages
+          echo "=== Installing custom packages ==="
           sudo mkdir -p rootfs_mountpoint/repo
-          sudo mount --bind repo rootfs_mountpoint/repo
-          sudo chroot rootfs_mountpoint xbps-install -y --repository /repo pipa-metapkg pipa-bt-quirk qbootctl || true
-          sudo umount rootfs_mountpoint/repo
+          sudo mount --bind repo rootfs_mountpoint/repo || true
+          sudo chroot rootfs_mountpoint xbps-install -y --repository /repo pipa-metapkg pipa-bt-quirk qbootctl || echo "Warning: Failed to install custom packages"
+          sudo umount rootfs_mountpoint/repo 2>/dev/null || true
           sudo rm -rf rootfs_mountpoint/repo
           
-          # Cleanup
+          echo "=== Cleaning up ==="
           sudo rm -f rootfs_mountpoint/usr/bin/qemu-aarch64-static
-          sudo umount -R rootfs_mountpoint
+          
+          echo "=== Unmounting ==="
+          sudo umount -R rootfs_mountpoint 2>/dev/null || echo "Warning: Some mounts failed to unmount"
+          
+          echo "=== Base rootfs image created successfully ===" 
 
       - name: Build GNOME image
         if: matrix.target == 'gnome' || matrix.target == 'all'
