@@ -204,6 +204,9 @@ jobs:
           echo "=== Configuring sudoers ==="
           echo "%wheel ALL=(ALL:ALL) ALL" | sudo tee rootfs_mountpoint/etc/sudoers.d/wheel > /dev/null
           
+          echo "=== Installing ca-certificates to fix SSL ==="
+          sudo chroot rootfs_mountpoint xbps-install -Sy ca-certificates || echo "Warning: ca-certificates install failed"
+          
           echo "=== Updating system packages ==="
           # Retry logic for xbps-install to handle network issues
           for i in 1 2 3; do
@@ -236,7 +239,9 @@ jobs:
           echo "=== Installing custom packages ==="
           sudo mkdir -p rootfs_mountpoint/repo
           sudo mount --bind repo rootfs_mountpoint/repo || true
-          sudo chroot rootfs_mountpoint xbps-install -y --repository /repo pipa-metapkg pipa-bt-quirk qbootctl || echo "Warning: Failed to install custom packages"
+          echo "Checking repository contents:"
+          ls -la repo/ || echo "Repo is empty"
+          sudo chroot rootfs_mountpoint xbps-install -y --repository /repo pipa-metapkg pipa-bt-quirk qbootctl || echo "Warning: Failed to install custom packages (repo may be empty)"
           sudo umount rootfs_mountpoint/repo 2>/dev/null || true
           sudo rm -rf rootfs_mountpoint/repo
           
@@ -295,7 +300,9 @@ jobs:
           echo "=== Installing custom packages ==="
           sudo mkdir -p rootfs_mountpoint/repo
           sudo mount --bind repo rootfs_mountpoint/repo
-          sudo chroot rootfs_mountpoint xbps-install -y --repository /repo pipa-metapkg pipa-bt-quirk pipa-sensors qbootctl || echo "Warning: Some custom packages failed to install"
+          echo "Checking repository contents:"
+          ls -la repo/ || echo "Repo is empty"
+          sudo chroot rootfs_mountpoint xbps-install -y --repository /repo pipa-metapkg pipa-bt-quirk pipa-sensors qbootctl || echo "Warning: Some custom packages failed to install (repo may be empty)"
           sudo umount rootfs_mountpoint/repo 2>/dev/null || true
           sudo rm -rf rootfs_mountpoint/repo
           
@@ -305,14 +312,30 @@ jobs:
           sudo chroot rootfs_mountpoint ln -sf /etc/sv/pipa-bt-quirk /etc/runit/runsvdir/default/ || true
           
           echo "=== Adding user to groups ==="
-          sudo chroot rootfs_mountpoint usermod -aG audio,video,bluetooth User || true
+          # Check if bluetooth group exists (created by bluez package)
+          if sudo chroot rootfs_mountpoint getent group bluetooth > /dev/null 2>&1; then
+            sudo chroot rootfs_mountpoint usermod -aG audio,video,bluetooth User || true
+          else
+            sudo chroot rootfs_mountpoint usermod -aG audio,video User || true
+            echo "Note: bluetooth group not found, skipping"
+          fi
           
           echo "=== Cleaning up ===" 
+          
+          # Extract boot.img before unmounting
+          if [ -f rootfs_mountpoint/boot/boot-*.img ]; then
+            echo "Found boot image, copying..."
+            cp rootfs_mountpoint/boot/boot-*.img ../boot.img
+          fi
+          
           sudo rm -f rootfs_mountpoint/usr/bin/qemu-aarch64-static
           sudo umount -R rootfs_mountpoint
           
-          # Convert to sparse
+          echo "=== Converting to sparse image ==="
           img2simg linux_gnome.img void_gnome.img
+          
+          echo "=== GNOME image build complete ==="
+          ls -lh void_gnome.img
 
       - name: Build KDE image
         if: matrix.target == 'kde' || matrix.target == 'all'
@@ -364,11 +387,27 @@ jobs:
       - name: Copy boot image
         run: |
           mkdir -p out
-          if [ -f workdir/rootfs_mountpoint/boot/boot-*.img ]; then
-            cp workdir/rootfs_mountpoint/boot/boot-*.img out/boot.img
+          # Copy boot.img (extracted during GNOME/KDE build)
+          if [ -f workdir/boot.img ]; then
+            echo "Copying boot.img..."
+            cp workdir/boot.img out/
+          else
+            echo "Warning: boot.img not found"
           fi
-          cp workdir/void_*.img out/ 2>/dev/null || true
-          ls -la out/
+          
+          # Copy sparse images
+          if [ -f workdir/void_gnome.img ]; then
+            echo "Copying void_gnome.img..."
+            cp workdir/void_gnome.img out/
+          fi
+          
+          if [ -f workdir/void_kde.img ]; then
+            echo "Copying void_kde.img..."
+            cp workdir/void_kde.img out/
+          fi
+          
+          echo "=== Final artifacts ==="
+          ls -lh out/
 
       - name: Upload images
         uses: actions/upload-artifact@v4
