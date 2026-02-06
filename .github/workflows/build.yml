@@ -49,12 +49,16 @@ jobs:
       run: |
         export PATH=$(realpath $WORKDIR/xbps-static/usr/bin):$PATH
         cd $WORKDIR/void-packages
-          echo "XBPS_CHROOT_CMD=ethereal" >> etc/conf
-          echo "XBPS_ALLOW_CHROOT_BREAKOUT=yes" >> etc/conf
-          ./xbps-src binary-bootstrap
-          for PACKAGE in $PACKAGES_BUILD; do
-            echo "::group::Building $PACKAGE"
-            ./xbps-src -a aarch64 pkg "$PACKAGE"
+        echo "XBPS_CHROOT_CMD=ethereal" >> etc/conf
+        echo "XBPS_ALLOW_CHROOT_BREAKOUT=yes" >> etc/conf
+        ./xbps-src binary-bootstrap
+        for PACKAGE in $PACKAGES_BUILD; do
+          echo "::group::Building $PACKAGE"
+          ./xbps-src -a aarch64 pkg "$PACKAGE"
+          echo "::endgroup::"
+        done
+        mkdir -p ../repo
+        cp -rv hostdir/binpkgs/* ../repo
 
     - name: Upload repo artifact
       uses: actions/upload-artifact@v4
