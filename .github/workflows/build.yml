@@ -1,449 +1,405 @@
-name: Build Void Linux for Xiaomi Pad 6
+name: Void Linux for Xiaomi Pad 6 (pipa)
 
 on:
   push:
-    branches: [main, master]
-  pull_request:
-    branches: [main, master]
   workflow_dispatch:
-    inputs:
-      target:
-        description: 'Build target'
-        required: true
-        default: 'gnome'
-        type: choice
-        options:
-          - base
-          - kde
-          - gnome
-          - all
+  schedule:
+  - cron: '0 0 * * 5' # Every Friday
+
+env:
+  ROOTFS_URI: "https://repo-fi.voidlinux.org/live/current/void-aarch64-ROOTFS-20250202.tar.xz"
+  QEMU_URI: "https://github.com/multiarch/qemu-user-static/releases/download/v7.2.0-1/qemu-aarch64-static"
+  XBPS_URI: "https://repo-fi.voidlinux.org/static/xbps-static-latest.x86_64-musl.tar.xz"
+  REPO: "https://repo-fi.voidlinux.org/voidlinux/current/aarch64"
+  PACKAGES: "pipa-metapkg pipa-bt-quirk qbootctl"
+  PACKAGES_BUILD: "pipa-metapkg pipa-bt-quirk pipa-sensors qbootctl"
+  WORKDIR: "workdir"
+  OUTDIR: "out"
 
 jobs:
+  # ──────────────────────────────────────────────
+  # Stage 1: Build custom xbps packages
+  # ──────────────────────────────────────────────
   build-packages:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
+    - name: Check out repository
+      uses: actions/checkout@v4
 
-      - name: Free disk space
-        run: |
-          sudo rm -rf /usr/share/dotnet
-          sudo rm -rf /usr/local/lib/android
-          sudo rm -rf /opt/ghc
-          sudo rm -rf /opt/hostedtoolcache/CodeQL
-          sudo docker image prune --all --force
-          df -h
+    - name: Set current date
+      run: echo "CURRENT_DATE=$(date +%Y-%m-%d)" >> $GITHUB_ENV
 
-      - name: Install dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            wget curl git tar xz-utils \
-            qemu-user-static binfmt-support
+    - name: Download xbps-static
+      run: |
+        mkdir -p $WORKDIR/xbps-static
+        wget -q "$XBPS_URI" -O $WORKDIR/xbps-static.tar.xz
+        tar xf $WORKDIR/xbps-static.tar.xz -C $WORKDIR/xbps-static
 
-      - name: Setup QEMU for aarch64
-        uses: docker/setup-qemu-action@v3
-        with:
-          platforms: arm64
+    - name: Clone void-packages & custom_repo
+      run: |
+        git clone https://github.com/void-linux/void-packages --depth=1 $WORKDIR/void-packages
+        git clone https://github.com/userg0d/custom_repo --depth=1 $WORKDIR/custom_repo
 
-      - name: Download xbps-static
-        run: |
-          mkdir -p workdir
-          cd workdir
-          wget https://repo-fi.voidlinux.org/static/xbps-static-latest.x86_64-musl.tar.xz -O xbps-static.tar.xz
-          mkdir xbps-static
-          tar xf xbps-static.tar.xz -C xbps-static
+    - name: Copy package templates
+      run: |
+        cp -r packages/* $WORKDIR/void-packages/srcpkgs/
+        cp -r $WORKDIR/custom_repo/srcpkgs/* $WORKDIR/void-packages/srcpkgs/
 
-      - name: Clone void-packages
-        run: |
-          cd workdir
-          git clone https://github.com/void-linux/void-packages --depth=1
+    - name: Build packages
+      run: |
+        export PATH=$(realpath $WORKDIR/xbps-static/usr/bin):$PATH
+        cd $WORKDIR/void-packages
+        XBPS_ALLOW_CHROOT_BREAKOUT=1 ./xbps-src binary-bootstrap
+        for PACKAGE in $PACKAGES_BUILD; do
+          echo "::group::Building $PACKAGE"
+          XBPS_ALLOW_CHROOT_BREAKOUT=1 ./xbps-src -a aarch64 pkg "$PACKAGE"
+          echo "::endgroup::"
+        done
+        mkdir -p ../repo
+        cp -rv hostdir/binpkgs/* ../repo
 
-      - name: Clone custom_repo
-        run: |
-          cd workdir
-          git clone https://github.com/userg0d/custom_repo --depth=1
+    - name: Upload repo artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: xbps-repo
+        path: ${{ env.WORKDIR }}/repo/
+        retention-days: 1
 
-      - name: Copy package templates
-        run: |
-          cp -r packages/* workdir/void-packages/srcpkgs/
-          cp -r workdir/custom_repo/srcpkgs/* workdir/void-packages/srcpkgs/
-
-      - name: Bootstrap void-packages
-        run: |
-          cd workdir/void-packages
-          export PATH="$(realpath ../xbps-static/usr/bin):$PATH"
-          echo "XBPS_CHROOT_CMD=ethereal" >> etc/conf
-          echo "XBPS_ALLOW_RESTRICTED=yes" >> etc/conf
-          echo "XBPS_ALLOW_CHROOT_BREAKOUT=1" >> etc/conf
-          ./xbps-src binary-bootstrap || echo "WARNING: bootstrap failed, continuing anyway"
-
-      - name: Build packages
-        run: |
-          cd workdir/void-packages
-          export PATH="$(realpath ../xbps-static/usr/bin):$PATH"
-          for pkg in pipa-metapkg pipa-bt-quirk pipa-sensors qbootctl; do
-            echo "Building $pkg..."
-            ./xbps-src -a aarch64 pkg $pkg 2>&1 || echo "Failed to build $pkg"
-          done
-
-      - name: Collect built packages
-        run: |
-          mkdir -p workdir/repo
-          cp -rv workdir/void-packages/hostdir/binpkgs/* workdir/repo/ 2>/dev/null || true
-          # Always create placeholder to ensure artifact exists
-          echo "Repository with custom Void Linux packages" > workdir/repo/README.txt
-          ls -la workdir/repo/
-
-      - name: Upload packages artifact
-        uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: void-pipa-packages
-          path: workdir/repo/
-          retention-days: 7
-          if-no-files-found: warn
-
-  build-rootfs:
-    needs: [build-packages]
+  # ──────────────────────────────────────────────
+  # Stage 2: Build base rootfs image
+  # ──────────────────────────────────────────────
+  build-base:
+    needs: build-packages
     runs-on: ubuntu-latest
-    if: always()
-    strategy:
-      matrix:
-        target: ${{ github.event_name == 'workflow_dispatch' && fromJSON(format('["{0}"]', inputs.target)) || fromJSON('["gnome"]') }}
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
+    - name: Check out repository
+      uses: actions/checkout@v4
 
-      - name: Free disk space
-        run: |
-          sudo rm -rf /usr/share/dotnet
-          sudo rm -rf /usr/local/lib/android
-          sudo rm -rf /opt/ghc
-          sudo rm -rf /opt/hostedtoolcache/CodeQL
-          sudo docker image prune --all --force
-          df -h
+    - name: Set current date
+      run: echo "CURRENT_DATE=$(date +%Y-%m-%d)" >> $GITHUB_ENV
 
-      - name: Install dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            wget curl git tar xz-utils \
-            e2fsprogs android-sdk-libsparse-utils \
-            qemu-user-static binfmt-support \
-            util-linux kmod coreutils
+    - name: Install host dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y android-sdk-libsparse-utils qemu-user-static
 
-      - name: Setup QEMU for aarch64
-        uses: docker/setup-qemu-action@v3
-        with:
-          platforms: arm64
+    - name: Download rootfs & qemu
+      run: |
+        mkdir -p $WORKDIR $OUTDIR
+        wget -q "$ROOTFS_URI" -O $WORKDIR/rootfs.tar.xz
+        wget -q "$QEMU_URI" -O $WORKDIR/qemu-aarch64-static
+        chmod +x $WORKDIR/qemu-aarch64-static
 
-      - name: Download packages artifact
-        uses: actions/download-artifact@v4
-        continue-on-error: true
-        with:
-          name: void-pipa-packages
-          path: workdir/repo/
+    - name: Download repo artifact
+      uses: actions/download-artifact@v4
+      with:
+        name: xbps-repo
+        path: ${{ env.WORKDIR }}/repo
 
-      - name: Create empty repo if needed
-        run: |
-          mkdir -p workdir/repo
-          ls -la workdir/repo/ || echo "Repo directory is empty or missing"
+    - name: Setup binfmt_misc
+      run: |
+        sudo modprobe binfmt_misc
+        sudo mount binfmt_misc /proc/sys/fs/binfmt_misc -t binfmt_misc 2>/dev/null || true
+        echo ':aarch64:M::\x7fELF\x02\x01\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x02\x00\xb7:\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xfe\xff\xff:/qemu-aarch64-static:' | sudo tee /proc/sys/fs/binfmt_misc/register || true
+        echo ':aarch64ld:M::\x7fELF\x02\x01\x01\x03\x00\x00\x00\x00\x00\x00\x00\x00\x03\x00\xb7:\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xfe\xff\xff:/qemu-aarch64-static:' | sudo tee /proc/sys/fs/binfmt_misc/register || true
 
-      - name: Download Void Linux rootfs
-        run: |
-          mkdir -p workdir
-          cd workdir
-          wget https://repo-fi.voidlinux.org/live/current/void-aarch64-ROOTFS-20250202.tar.xz -O rootfs.tar.xz
+    - name: Create and mount base image
+      run: |
+        cd $WORKDIR
+        truncate -s 4G linux.img
+        mkfs.ext4 linux.img
+        mkdir -p rootfs_mountpoint
+        sudo mount linux.img rootfs_mountpoint
+        sudo tar xf rootfs.tar.xz -C rootfs_mountpoint
+        sudo install -m755 qemu-aarch64-static rootfs_mountpoint/
 
-      - name: Download qemu-aarch64-static
-        run: |
-          cd workdir
-          wget https://github.com/multiarch/qemu-user-static/releases/download/v7.2.0-1/qemu-aarch64-static
-          chmod +x qemu-aarch64-static
+    - name: Bind-mount host filesystems
+      run: |
+        cd $WORKDIR
+        sudo mount --bind /dev rootfs_mountpoint/dev
+        sudo mount --bind /dev/pts rootfs_mountpoint/dev/pts
+        sudo mount --bind /proc rootfs_mountpoint/proc
+        sudo mount --bind /sys rootfs_mountpoint/sys
 
-      - name: Create base rootfs image
-        run: |
-          set -e  # Exit on any error
-          cd workdir
-          
-          echo "=== Creating ext4 image ==="
-          truncate -s 4G linux.img
-          mkfs.ext4 -F linux.img
-          
-          echo "=== Mounting image ==="
-          sudo mkdir -p rootfs_mountpoint
-          sudo mount -t ext4 linux.img rootfs_mountpoint
-          
-          echo "=== Extracting rootfs ==="
-          sudo tar xf rootfs.tar.xz -C rootfs_mountpoint --checkpoint=.100
-          
-          echo "=== Installing QEMU ==="
-          sudo install -m755 qemu-aarch64-static rootfs_mountpoint/usr/bin/
-          
-          echo "=== Setting up bind mounts ==="
-          sudo mount --bind /dev rootfs_mountpoint/dev || true
-          sudo mount --bind /dev/pts rootfs_mountpoint/dev/pts || true
-          sudo mount --bind /proc rootfs_mountpoint/proc || true
-          sudo mount --bind /sys rootfs_mountpoint/sys || true
-          
-          echo "=== Configuring system ==="
-          echo "pad" | sudo tee rootfs_mountpoint/etc/hostname > /dev/null
-          uuid=$(sudo blkid -o value -s UUID linux.img)
-          echo "UUID=$uuid / ext4 defaults 0 0" | sudo tee -a rootfs_mountpoint/etc/fstab > /dev/null
-          echo "nameserver 1.1.1.1" | sudo tee rootfs_mountpoint/etc/resolv.conf > /dev/null
-          echo "root=UUID=$uuid noquiet loglevel=2 console=tty0 earlycon=tty0 keep_bootcon fbcon=rotate:1 fbcon=font:VGA8x16 rw" | sudo tee rootfs_mountpoint/etc/cmdline > /dev/null
-          
-          echo "=== Creating user ==="
-          sudo chroot rootfs_mountpoint useradd -m -g users -G wheel User || echo "User already exists"
-          
-          echo "=== Setting passwords ==="
-          echo 'root:pipa' | sudo chroot rootfs_mountpoint chpasswd || echo "Failed to set root password"
-          echo 'User:123' | sudo chroot rootfs_mountpoint chpasswd || echo "Failed to set user password"
-          
-          echo "=== Configuring sudoers ==="
-          echo "%wheel ALL=(ALL:ALL) ALL" | sudo tee rootfs_mountpoint/etc/sudoers.d/wheel > /dev/null
-          
-          echo "=== Installing ca-certificates to fix SSL ==="
-          sudo chroot rootfs_mountpoint xbps-install -Sy ca-certificates || echo "Warning: ca-certificates install failed"
-          
-          echo "=== Updating system packages ==="
-          # Retry logic for xbps-install to handle network issues
-          for i in 1 2 3; do
-            echo "Attempt $i: Updating xbps..."
-            sudo chroot rootfs_mountpoint xbps-install -Syu xbps && break
-            sleep 10
-          done || echo "Warning: Failed to update xbps after 3 attempts"
-          
-          for i in 1 2 3; do
-            echo "Attempt $i: Updating system..."
-            sudo chroot rootfs_mountpoint xbps-install -Syuv && break
-            sleep 10
-          done || echo "Warning: Failed to update system after 3 attempts"
-          
-          for i in 1 2 3; do
-            echo "Attempt $i: Installing base packages..."
-            sudo chroot rootfs_mountpoint xbps-install -Sy NetworkManager chrony fake-hwclock nano && break
-            sleep 10
-          done || echo "Warning: Failed to install base packages after 3 attempts"
-          
-          echo "=== Installing zzz hook ==="
-          sudo mkdir -p rootfs_mountpoint/etc/zzz.d
-          sudo install -m755 ../config/zzz/99-cpu-control.sh rootfs_mountpoint/etc/zzz.d/
-          
-          echo "=== Enabling services ==="
-          sudo chroot rootfs_mountpoint ln -sf /etc/sv/dbus /etc/runit/runsvdir/default/ || true
-          sudo chroot rootfs_mountpoint ln -sf /etc/sv/NetworkManager /etc/runit/runsvdir/default/ || true
-          sudo chroot rootfs_mountpoint ln -sf /etc/sv/chronyd /etc/runit/runsvdir/default/ || true
-          
-          echo "=== Installing custom packages ==="
-          sudo mkdir -p rootfs_mountpoint/repo
-          sudo mount --bind repo rootfs_mountpoint/repo || true
-          echo "Checking repository contents:"
-          ls -la repo/ || echo "Repo is empty"
-          sudo chroot rootfs_mountpoint xbps-install -y --repository /repo pipa-metapkg pipa-bt-quirk qbootctl || echo "Warning: Failed to install custom packages (repo may be empty)"
-          sudo umount rootfs_mountpoint/repo 2>/dev/null || true
-          sudo rm -rf rootfs_mountpoint/repo
-          
-          echo "=== Cleaning up ==="
-          sudo rm -f rootfs_mountpoint/usr/bin/qemu-aarch64-static
-          
-          echo "=== Unmounting ==="
-          sudo umount -R rootfs_mountpoint 2>/dev/null || echo "Warning: Some mounts failed to unmount"
-          
-          echo "=== Base rootfs image created successfully ===" 
+    - name: Configure base system
+      run: |
+        cd $WORKDIR
+        MP=rootfs_mountpoint
 
-      - name: Build GNOME image
-        if: matrix.target == 'gnome' || matrix.target == 'all'
-        run: |
-          cd workdir
-          
-          cp linux.img linux_gnome.img
-          e2fsck -fy linux_gnome.img || true
-          resize2fs linux_gnome.img 12G
-          
-          sudo mount linux_gnome.img rootfs_mountpoint
-          sudo mount --bind /dev rootfs_mountpoint/dev
-          sudo mount --bind /dev/pts rootfs_mountpoint/dev/pts
-          sudo mount --bind /proc rootfs_mountpoint/proc
-          sudo mount --bind /sys rootfs_mountpoint/sys
-          
-          sudo install -m755 qemu-aarch64-static rootfs_mountpoint/usr/bin/
-          
-          # Install full GNOME desktop environment
-          sudo chroot rootfs_mountpoint xbps-install -Suy \
-            gnome \
-            gnome-console \
-            gnome-tweaks \
-            gnome-browser-connector \
-            firefox \
-            gdm \
-            mesa-freedreno-dri \
-            pipewire \
-            wireplumber \
-            bluez \
-            libspa-bluetooth \
-            xdg-desktop-portal-gtk \
-            xdg-desktop-portal-gnome \
-            pulseaudio \
-            linux-firmware \
-            linux-firmware-qualcomm \
-            light \
-            gst-plugins-good1 \
-            gst-plugins-bad1 \
-            gst-plugins-ugly1 \
-            gstreamer1 \
-            gstreamer-vaapi \
-            NetworkManager-openvpn \
-            gnome-keyring || (echo "Retrying GNOME install..." && sleep 30 && sudo chroot rootfs_mountpoint xbps-install -Suy gnome gnome-console gnome-tweaks gnome-browser-connector firefox gdm mesa-freedreno-dri pipewire wireplumber bluez libspa-bluetooth xdg-desktop-portal-gtk xdg-desktop-portal-gnome pulseaudio linux-firmware linux-firmware-qualcomm light gst-plugins-good1 gst-plugins-bad1 gst-plugins-ugly1 gstreamer1 gstreamer-vaapi NetworkManager-openvpn gnome-keyring) || echo "Warning: GNOME installation incomplete"
-          
-          echo "=== Installing custom packages ==="
-          sudo mkdir -p rootfs_mountpoint/repo
-          sudo mount --bind repo rootfs_mountpoint/repo
-          echo "Checking repository contents:"
-          ls -la repo/ || echo "Repo is empty"
-          sudo chroot rootfs_mountpoint xbps-install -y --repository /repo pipa-metapkg pipa-bt-quirk pipa-sensors qbootctl || echo "Warning: Some custom packages failed to install (repo may be empty)"
-          sudo umount rootfs_mountpoint/repo 2>/dev/null || true
-          sudo rm -rf rootfs_mountpoint/repo
-          
-          echo "=== Enabling services ==="
-          sudo chroot rootfs_mountpoint ln -sf /etc/sv/gdm /etc/runit/runsvdir/default/ || true
-          sudo chroot rootfs_mountpoint ln -sf /etc/sv/bluetoothd /etc/runit/runsvdir/default/ || true
-          sudo chroot rootfs_mountpoint ln -sf /etc/sv/pipa-bt-quirk /etc/runit/runsvdir/default/ || true
-          
-          echo "=== Adding user to groups ==="
-          # Check if bluetooth group exists (created by bluez package)
-          if sudo chroot rootfs_mountpoint getent group bluetooth > /dev/null 2>&1; then
-            sudo chroot rootfs_mountpoint usermod -aG audio,video,bluetooth User || true
-          else
-            sudo chroot rootfs_mountpoint usermod -aG audio,video User || true
-            echo "Note: bluetooth group not found, skipping"
-          fi
-          
-          echo "=== Cleaning up ===" 
-          
-          # Extract boot.img before unmounting
-          if [ -f rootfs_mountpoint/boot/boot-*.img ]; then
-            echo "Found boot image, copying..."
-            cp rootfs_mountpoint/boot/boot-*.img ../boot.img
-          fi
-          
-          sudo rm -f rootfs_mountpoint/usr/bin/qemu-aarch64-static
-          sudo umount -R rootfs_mountpoint
-          
-          echo "=== Converting to sparse image ==="
-          img2simg linux_gnome.img void_gnome.img
-          
-          echo "=== GNOME image build complete ==="
-          ls -lh void_gnome.img
+        # Hostname & networking
+        echo "xiaomi-pad-6" | sudo tee $MP/etc/hostname
+        echo "nameserver 1.1.1.1" | sudo tee $MP/etc/resolv.conf
 
-      - name: Build KDE image
-        if: matrix.target == 'kde' || matrix.target == 'all'
-        run: |
-          cd workdir
-          
-          cp linux.img linux_kde.img
-          e2fsck -fy linux_kde.img || true
-          resize2fs linux_kde.img 8G
-          
-          sudo mount linux_kde.img rootfs_mountpoint
-          sudo mount --bind /dev rootfs_mountpoint/dev
-          sudo mount --bind /dev/pts rootfs_mountpoint/dev/pts
-          sudo mount --bind /proc rootfs_mountpoint/proc
-          sudo mount --bind /sys rootfs_mountpoint/sys
-          
-          sudo install -m755 qemu-aarch64-static rootfs_mountpoint/usr/bin/
-          
-          # Install KDE
-          sudo chroot rootfs_mountpoint xbps-install -Suy kde-plasma konsole sddm mesa-freedreno-dri maliit-keyboard pipewire bluez libspa-bluetooth xdg-desktop-portal-kde pulseaudio
-          
-          # Install custom packages
-          sudo mkdir -p rootfs_mountpoint/repo
-          sudo mount --bind repo rootfs_mountpoint/repo
-          sudo chroot rootfs_mountpoint xbps-install -y --repository /repo pipa-metapkg pipa-bt-quirk qbootctl || true
-          sudo umount rootfs_mountpoint/repo
-          sudo rm -rf rootfs_mountpoint/repo
-          
-          # SDDM config
-          sudo mkdir -p rootfs_mountpoint/etc/sddm.conf.d/
-          sudo cp ../config/kde/sddm/10-wayland.conf rootfs_mountpoint/etc/sddm.conf.d/
-          sudo cp ../config/kde/sddm/50-theme.conf rootfs_mountpoint/etc/sddm.conf.d/
-          
-          # Enable services
-          sudo chroot rootfs_mountpoint ln -sf /etc/sv/sddm /etc/runit/runsvdir/default/
-          sudo chroot rootfs_mountpoint ln -sf /etc/sv/bluetoothd /etc/runit/runsvdir/default/
-          sudo chroot rootfs_mountpoint ln -sf /etc/sv/pipa-bt-quirk /etc/runit/runsvdir/default/ || true
-          
-          # Add user to groups
-          sudo chroot rootfs_mountpoint usermod -aG audio,video,bluetooth User
-          
-          # Cleanup
-          sudo rm -f rootfs_mountpoint/usr/bin/qemu-aarch64-static
-          sudo umount -R rootfs_mountpoint
-          
-          # Convert to sparse
-          img2simg linux_kde.img void_kde.img
+        # fstab
+        uuid=$(blkid -o value linux.img | head -n 1)
+        echo "UUID=$uuid / ext4 defaults 0 0" | sudo tee -a $MP/etc/fstab
 
-      - name: Copy boot image
-        run: |
-          mkdir -p out
-          # Copy boot.img (extracted during GNOME/KDE build)
-          if [ -f workdir/boot.img ]; then
-            echo "Copying boot.img..."
-            cp workdir/boot.img out/
-          else
-            echo "Warning: boot.img not found"
-          fi
-          
-          # Copy sparse images
-          if [ -f workdir/void_gnome.img ]; then
-            echo "Copying void_gnome.img..."
-            cp workdir/void_gnome.img out/
-          fi
-          
-          if [ -f workdir/void_kde.img ]; then
-            echo "Copying void_kde.img..."
-            cp workdir/void_kde.img out/
-          fi
-          
-          echo "=== Final artifacts ==="
-          ls -lh out/
+        # Kernel cmdline
+        echo "root=UUID=$uuid noquiet loglevel=2 console=tty0 earlycon=tty0 keep_bootcon fbcon=rotate:1 fbcon=font:VGA8x16 rw" | sudo tee $MP/etc/cmdline
 
-      - name: Upload images
-        uses: actions/upload-artifact@v4
-        with:
-          name: void-pipa-${{ matrix.target }}
-          path: out/
-          retention-days: 30
+        # Users
+        sudo chroot $MP useradd -m -g users -G wheel user
+        sudo chroot $MP bash -c "echo 'root:root' | chpasswd"
+        sudo chroot $MP bash -c "echo 'user:1' | chpasswd"
+        echo "%wheel ALL=(ALL:ALL) ALL" | sudo tee $MP/etc/sudoers.d/wheel
 
-  release:
-    needs: build-rootfs
+    - name: Install base packages
+      run: |
+        cd $WORKDIR
+        MP=rootfs_mountpoint
+        sudo chroot $MP xbps-install -Syu xbps
+        sudo chroot $MP xbps-install -Syuv
+        sudo chroot $MP xbps-install -Sy NetworkManager chrony fake-hwclock nano
+
+    - name: Install zzz CPU control hook
+      run: |
+        cd $WORKDIR
+        MP=rootfs_mountpoint
+        sudo mkdir -p $MP/etc/zzz.d
+        sudo install -m755 ../config/zzz/99-cpu-control.sh $MP/etc/zzz.d/99-cpu-control.sh
+
+    - name: Enable base services
+      run: |
+        cd $WORKDIR
+        MP=rootfs_mountpoint
+        sudo chroot $MP /bin/bash -c "ln -sv /etc/sv/dbus /etc/runit/runsvdir/default"
+        sudo chroot $MP /bin/bash -c "ln -sv /etc/sv/NetworkManager /etc/runit/runsvdir/default"
+        sudo chroot $MP /bin/bash -c "ln -sv /etc/sv/chronyd /etc/runit/runsvdir/default"
+
+    - name: Install custom packages from repo
+      run: |
+        cd $WORKDIR
+        MP=rootfs_mountpoint
+        sudo mkdir -p $MP/repo
+        sudo mount --bind repo $MP/repo
+        sudo chroot $MP xbps-install -y --repository /repo $PACKAGES
+        sudo umount $MP/repo
+        sudo rm -rf $MP/repo
+
+    - name: Extract boot image & finalize base
+      run: |
+        cd $WORKDIR
+        MP=rootfs_mountpoint
+        sudo cp $MP/boot/boot-*.img ../$OUTDIR/boot.img
+        sudo rm $MP/qemu-aarch64-static
+        sudo umount -R $MP
+        img2simg linux.img ../$OUTDIR/void_base.img
+
+    - name: Upload base image artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: void-base_${{ env.CURRENT_DATE }}
+        path: |
+          out/boot.img
+          out/void_base.img
+        retention-days: 7
+
+    - name: Upload raw linux.img for DE builds
+      uses: actions/upload-artifact@v4
+      with:
+        name: linux-img-raw
+        path: |
+          ${{ env.WORKDIR }}/linux.img
+          ${{ env.WORKDIR }}/qemu-aarch64-static
+        retention-days: 1
+
+  # ──────────────────────────────────────────────
+  # Stage 3: Build GNOME image (on top of base)
+  # ──────────────────────────────────────────────
+  build-gnome:
+    needs: build-base
     runs-on: ubuntu-latest
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     steps:
-      - name: Download all artifacts
-        uses: actions/download-artifact@v4
-        with:
-          path: artifacts/
+    - name: Check out repository
+      uses: actions/checkout@v4
 
-      - name: Create Release
-        uses: softprops/action-gh-release@v1
-        with:
-          tag_name: build-${{ github.run_number }}
-          name: Build ${{ github.run_number }}
-          body: |
-            Automated build of Void Linux for Xiaomi Pad 6
-            
-            ## Images
-            - `void_gnome.img` - GNOME desktop
-            - `void_kde.img` - KDE Plasma desktop
-            - `boot.img` - Boot image
-            
-            ## Default credentials
-            - root: `pipa`
-            - User: `123`
-          files: artifacts/**/*
-          draft: false
-          prerelease: true
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    - name: Set current date
+      run: echo "CURRENT_DATE=$(date +%Y-%m-%d)" >> $GITHUB_ENV
+
+    - name: Install host dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y android-sdk-libsparse-utils qemu-user-static
+
+    - name: Download raw base image
+      uses: actions/download-artifact@v4
+      with:
+        name: linux-img-raw
+        path: ${{ env.WORKDIR }}
+
+    - name: Download repo artifact
+      uses: actions/download-artifact@v4
+      with:
+        name: xbps-repo
+        path: ${{ env.WORKDIR }}/repo
+
+    - name: Free up disk space
+      run: |
+        sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc
+        df -h
+
+    - name: Setup binfmt_misc
+      run: |
+        sudo modprobe binfmt_misc
+        sudo mount binfmt_misc /proc/sys/fs/binfmt_misc -t binfmt_misc 2>/dev/null || true
+        echo ':aarch64:M::\x7fELF\x02\x01\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x02\x00\xb7:\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xfe\xff\xff:/qemu-aarch64-static:' | sudo tee /proc/sys/fs/binfmt_misc/register || true
+        echo ':aarch64ld:M::\x7fELF\x02\x01\x01\x03\x00\x00\x00\x00\x00\x00\x00\x00\x03\x00\xb7:\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xfe\xff\xff:/qemu-aarch64-static:' | sudo tee /proc/sys/fs/binfmt_misc/register || true
+
+    - name: Prepare GNOME image
+      run: |
+        cd $WORKDIR
+        cp linux.img linux_gnome.img
+        e2fsck -f -y linux_gnome.img
+        resize2fs linux_gnome.img 8G
+        mkdir -p rootfs_mountpoint
+        sudo mount linux_gnome.img rootfs_mountpoint
+        sudo install -m755 qemu-aarch64-static rootfs_mountpoint/
+        sudo mount --bind /dev rootfs_mountpoint/dev
+        sudo mount --bind /dev/pts rootfs_mountpoint/dev/pts
+        sudo mount --bind /proc rootfs_mountpoint/proc
+        sudo mount --bind /sys rootfs_mountpoint/sys
+
+    - name: Install GNOME packages
+      run: |
+        cd $WORKDIR
+        MP=rootfs_mountpoint
+        sudo chroot $MP xbps-install -Suy gnome-core gnome-console firefox gdm mesa-freedreno-dri pipewire bluez libspa-bluetooth xdg-desktop-portal-gtk pulseaudio
+
+    - name: Install custom packages from repo (GNOME)
+      run: |
+        cd $WORKDIR
+        MP=rootfs_mountpoint
+        sudo mkdir -p $MP/repo
+        sudo mount --bind repo $MP/repo
+        sudo chroot $MP xbps-install -y --repository /repo $PACKAGES
+        sudo umount $MP/repo
+        sudo rm -rf $MP/repo
+
+    - name: Enable GNOME services
+      run: |
+        cd $WORKDIR
+        MP=rootfs_mountpoint
+        sudo chroot $MP /bin/bash -c "ln -sv /etc/sv/gdm /etc/runit/runsvdir/default"
+        sudo chroot $MP /bin/bash -c "ln -sv /etc/sv/bluetoothd /etc/runit/runsvdir/default"
+        sudo chroot $MP /bin/bash -c "ln -sv /etc/sv/pipa-bt-quirk /etc/runit/runsvdir/default"
+        sudo chroot $MP /sbin/usermod -aG audio,video,bluetooth user
+
+    - name: Finalize GNOME image
+      run: |
+        cd $WORKDIR
+        mkdir -p ../$OUTDIR
+        sudo rm rootfs_mountpoint/qemu-aarch64-static
+        sudo umount -R rootfs_mountpoint
+        img2simg linux_gnome.img ../$OUTDIR/void_gnome.img
+
+    - name: Upload GNOME image
+      uses: actions/upload-artifact@v4
+      with:
+        name: void-gnome_${{ env.CURRENT_DATE }}
+        path: out/void_gnome.img
+        retention-days: 7
+
+  # ──────────────────────────────────────────────
+  # Stage 4: Build KDE image (on top of base)
+  # ──────────────────────────────────────────────
+  build-kde:
+    needs: build-base
+    runs-on: ubuntu-latest
+    steps:
+    - name: Check out repository
+      uses: actions/checkout@v4
+
+    - name: Set current date
+      run: echo "CURRENT_DATE=$(date +%Y-%m-%d)" >> $GITHUB_ENV
+
+    - name: Install host dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y android-sdk-libsparse-utils qemu-user-static
+
+    - name: Download raw base image
+      uses: actions/download-artifact@v4
+      with:
+        name: linux-img-raw
+        path: ${{ env.WORKDIR }}
+
+    - name: Download repo artifact
+      uses: actions/download-artifact@v4
+      with:
+        name: xbps-repo
+        path: ${{ env.WORKDIR }}/repo
+
+    - name: Free up disk space
+      run: |
+        sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc
+        df -h
+
+    - name: Setup binfmt_misc
+      run: |
+        sudo modprobe binfmt_misc
+        sudo mount binfmt_misc /proc/sys/fs/binfmt_misc -t binfmt_misc 2>/dev/null || true
+        echo ':aarch64:M::\x7fELF\x02\x01\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x02\x00\xb7:\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xfe\xff\xff:/qemu-aarch64-static:' | sudo tee /proc/sys/fs/binfmt_misc/register || true
+        echo ':aarch64ld:M::\x7fELF\x02\x01\x01\x03\x00\x00\x00\x00\x00\x00\x00\x00\x03\x00\xb7:\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xfe\xff\xff:/qemu-aarch64-static:' | sudo tee /proc/sys/fs/binfmt_misc/register || true
+
+    - name: Prepare KDE image
+      run: |
+        cd $WORKDIR
+        cp linux.img linux_kde.img
+        e2fsck -f -y linux_kde.img
+        resize2fs linux_kde.img 8G
+        mkdir -p rootfs_mountpoint
+        sudo mount linux_kde.img rootfs_mountpoint
+        sudo install -m755 qemu-aarch64-static rootfs_mountpoint/
+        sudo mount --bind /dev rootfs_mountpoint/dev
+        sudo mount --bind /dev/pts rootfs_mountpoint/dev/pts
+        sudo mount --bind /proc rootfs_mountpoint/proc
+        sudo mount --bind /sys rootfs_mountpoint/sys
+
+    - name: Install KDE packages
+      run: |
+        cd $WORKDIR
+        MP=rootfs_mountpoint
+        sudo chroot $MP xbps-install -Suy kde-plasma konsole sddm mesa-freedreno-dri maliit-keyboard pipewire bluez libspa-bluetooth xdg-desktop-portal-kde pulseaudio
+
+    - name: Install custom packages from repo (KDE)
+      run: |
+        cd $WORKDIR
+        MP=rootfs_mountpoint
+        sudo mkdir -p $MP/repo
+        sudo mount --bind repo $MP/repo
+        sudo chroot $MP xbps-install -y --repository /repo $PACKAGES
+        sudo umount $MP/repo
+        sudo rm -rf $MP/repo
+
+    - name: Configure SDDM
+      run: |
+        cd $WORKDIR
+        MP=rootfs_mountpoint
+        sudo chroot $MP touch /etc/sddm.conf
+        sudo chroot $MP mkdir -p /etc/sddm.conf.d/
+        sudo cp config/kde/sddm/10-wayland.conf $MP/etc/sddm.conf.d/
+        sudo cp config/kde/sddm/50-theme.conf $MP/etc/sddm.conf.d/
+
+    - name: Enable KDE services
+      run: |
+        cd $WORKDIR
+        MP=rootfs_mountpoint
+        sudo chroot $MP /bin/bash -c "ln -sv /etc/sv/sddm /etc/runit/runsvdir/default"
+        sudo chroot $MP /bin/bash -c "ln -sv /etc/sv/bluetoothd /etc/runit/runsvdir/default"
+        sudo chroot $MP /bin/bash -c "ln -sv /etc/sv/pipa-bt-quirk /etc/runit/runsvdir/default"
+        sudo chroot $MP /sbin/usermod -aG audio,video,bluetooth user
+
+    - name: Finalize KDE image
+      run: |
+        cd $WORKDIR
+        mkdir -p ../$OUTDIR
+        sudo rm rootfs_mountpoint/qemu-aarch64-static
+        sudo umount -R rootfs_mountpoint
+        img2simg linux_kde.img ../$OUTDIR/void_kde.img
+
+    - name: Upload KDE image
+      uses: actions/upload-artifact@v4
+      with:
+        name: void-kde_${{ env.CURRENT_DATE }}
+        path: out/void_kde.img
+        retention-days: 7
