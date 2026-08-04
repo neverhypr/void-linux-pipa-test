@@ -38,7 +38,7 @@ jobs:
     - name: Clone void-packages & custom_repo
       run: |
         git clone https://github.com/void-linux/void-packages --depth=1 $WORKDIR/void-packages
-        git clone https://github.com/userg0d/custom_repo --depth=1 $WORKDIR/custom_repo
+        git clone https://github.com/neverhypr/void-repo-test --depth=1 $WORKDIR/custom_repo
 
     - name: Copy package templates
       run: |
