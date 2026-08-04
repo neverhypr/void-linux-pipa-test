@@ -1,15 +1,15 @@
 # Template file for 'linux6.18-pipa'
-pkgname=linux6.18-pipa
-version=6.18.2
+pkgname=linux-strawberry
+version=7.1.2
 revision=1
 short_desc="Linux kernel and modules (${version%.*} series for Xiaomi Pad 6)"
-maintainer="Arseniy <me@adomerle.pw>"
+maintainer="Koopa Troopa <neverhypr@proton.me>"
 license="GPL-2.0-only"
 homepage="https://www.kernel.org"
-commit="94667e4db7ce587282d2ed97361ec5b971c83184"
-distfiles="https://github.com/userg0d/linux/archive/${commit}/linux-${commit}.tar.gz"
+branch="pipa/7.1.2"
+distfiles="https://github.com/rmuxnet/linux/archive/refs/heads/${branch}.tar.gz"
 
-checksum="4b6bc8e690e6bec5bef1d357eb0c86b89ed9c1f2aaac1e48597c60fd47ceab01"
+checksum="b1f9d407032eebad11d8298b56a5a5371ae62cb0463e5e7b8e03ab1f04e9f796"
 python_version=3
 
 archs="aarch64*"
@@ -23,7 +23,7 @@ preserve=yes
 hostmakedepends="tar xz bc elfutils-devel flex gmp-devel kmod libmpc-devel
  pkg-config openssl-devel perl uboot-mkimage cpio pahole python3 zstd"
 
-_localversion="sm8250-github.com@userg0d"
+_localversion="pipa"
 _kernver="${version}-${_localversion}"
 triggers="kernel-hooks"
 kernel_hooks_version="${_kernver}"
