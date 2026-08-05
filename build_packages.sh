@@ -27,7 +27,7 @@ if [ ! -d "void-packages" ]; then
 fi
 
 if [ ! -d "custom_repo" ]; then
-    git clone https://github.com/neverhypr/void-repo-test --depth=1
+    git clone https://github.com/neverhypr/custom_repo --depth=1
 fi
 
 cp -r ../packages/* void-packages/srcpkgs/
